@@ -1,0 +1,43 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Linux
+*~
+.directory
+.Trash-*
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# Test directories (if you create them)
+test/
+tmp/
+temp/
+
+# SSH keys (never commit real keys!)
+*.pem
+*.key
+id_rsa
+id_ed25519
+id_ecdsa
+*.pub
+
+# Logs
+*.log
+
+# OS generated files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
