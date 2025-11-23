@@ -1,0 +1,1069 @@
+#!/bin/sh
+
+# SSH Key Switcher (skw)
+# A tool to manage multiple SSH key profiles
+
+set -e
+
+VERSION="1.0.0"
+PROFILES_DIR="$HOME/.ssh-profiles"
+BACKUP_DIR="$HOME/.ssh-backup"
+SSH_DIR="$HOME/.ssh"
+CURRENT_PROFILE_FILE="$PROFILES_DIR/.current-profile"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Helper functions
+print_error() {
+    printf "${RED}Error: %s${NC}\n" "$1" >&2
+}
+
+print_success() {
+    printf "${GREEN}%s${NC}\n" "$1"
+}
+
+print_info() {
+    printf "${BLUE}%s${NC}\n" "$1"
+}
+
+print_warning() {
+    printf "${YELLOW}%s${NC}\n" "$1"
+}
+
+# Check if profiles directory is initialized
+check_init() {
+    if [ ! -d "$PROFILES_DIR" ]; then
+        print_error "SSH Key Switcher not initialized. Run 'skw init' first."
+        exit 1
+    fi
+}
+
+# Initialize the tool
+cmd_init() {
+    # Check if already initialized
+    if [ -d "$PROFILES_DIR" ] && [ "$(ls -A "$PROFILES_DIR" 2>/dev/null | grep -v '^\.')" ]; then
+        print_success "SSH Key Switcher is already initialized."
+        echo ""
+        
+        # Count existing profiles
+        profile_count=0
+        profile_names=""
+        for pd in "$PROFILES_DIR"/*; do
+            if [ -d "$pd" ]; then
+                pname=$(basename "$pd")
+                if ! echo "$pname" | grep -q "^\."; then
+                    profile_count=$((profile_count + 1))
+                    if [ -z "$profile_names" ]; then
+                        profile_names="$pname"
+                    else
+                        profile_names="$profile_names, $pname"
+                    fi
+                fi
+            fi
+        done
+        
+        if [ $profile_count -gt 0 ]; then
+            echo "Existing profiles: $profile_names ($profile_count total)"
+            
+            # Show current profile
+            if [ -f "$CURRENT_PROFILE_FILE" ]; then
+                current_profile=$(cat "$CURRENT_PROFILE_FILE")
+                echo "Active profile: $current_profile"
+            fi
+            echo ""
+        fi
+        
+        # Check for unmanaged keys
+        print_info "Checking for unmanaged keys..."
+        
+        unmanaged_count=0
+        for key_file in "$SSH_DIR"/id_*; do
+            if [ -f "$key_file" ] && ! echo "$key_file" | grep -q '\.pub$'; then
+                # Exclude non-key files
+                basename_key=$(basename "$key_file")
+                if echo "$basename_key" | grep -q "^known_hosts\|^config\|^authorized_keys\|^environment"; then
+                    continue
+                fi
+                
+                if [ -f "$key_file.pub" ]; then
+                    key_fingerprint=$(ssh-keygen -lf "$key_file.pub" 2>/dev/null | awk '{print $2}')
+                else
+                    key_fingerprint=$(ssh-keygen -lf "$key_file" 2>/dev/null | awk '{print $2}')
+                fi
+                if [ -z "$key_fingerprint" ]; then
+                    continue
+                fi
+                
+                is_managed=0
+                for profile_dir in "$PROFILES_DIR"/*; do
+                    if [ -d "$profile_dir" ]; then
+                        for profile_key in "$profile_dir"/id_*; do
+                            if [ -f "$profile_key" ] && ! echo "$profile_key" | grep -q '\.pub$'; then
+                                if [ -f "$profile_key.pub" ]; then
+                                    profile_fingerprint=$(ssh-keygen -lf "$profile_key.pub" 2>/dev/null | awk '{print $2}')
+                                else
+                                    profile_fingerprint=$(ssh-keygen -lf "$profile_key" 2>/dev/null | awk '{print $2}')
+                                fi
+                                if [ "$key_fingerprint" = "$profile_fingerprint" ]; then
+                                    is_managed=1
+                                    break
+                                fi
+                            fi
+                        done
+                        if [ $is_managed -eq 1 ]; then
+                            break
+                        fi
+                    fi
+                done
+                
+                if [ $is_managed -eq 0 ]; then
+                    unmanaged_count=$((unmanaged_count + 1))
+                fi
+            fi
+        done
+        
+        if [ $unmanaged_count -gt 0 ]; then
+            print_warning "Found $unmanaged_count unmanaged key(s) in ~/.ssh/"
+            echo ""
+            printf "Would you like to organize them now? (Y/n): "
+            read -r response
+            
+            response=${response:-Y}
+            if [ "$response" = "y" ] || [ "$response" = "Y" ]; then
+                cmd_organize
+            else
+                echo ""
+                print_info "You can organize them later with: skw organize"
+            fi
+        else
+            print_success "No unmanaged keys found."
+            echo ""
+            print_info "All SSH keys are already organized in profiles."
+        fi
+        
+        return 0
+    fi
+    
+    print_info "Initializing SSH Key Switcher..."
+    
+    # Create directories
+    mkdir -p "$PROFILES_DIR"
+    mkdir -p "$BACKUP_DIR"
+    
+    print_success "Created directory: $PROFILES_DIR"
+    print_success "Created directory: $BACKUP_DIR"
+    echo ""
+    
+    # Scan for ALL SSH keys
+    found_keys=""
+    key_count=0
+    
+    for key_file in "$SSH_DIR"/id_*; do
+        if [ -f "$key_file" ] && ! echo "$key_file" | grep -q '\.pub$'; then
+            # Exclude non-key files
+            basename_key=$(basename "$key_file")
+            if echo "$basename_key" | grep -q "^known_hosts\|^config\|^authorized_keys\|^environment"; then
+                continue
+            fi
+            
+            # Verify it's a valid SSH key (prefer .pub to avoid passphrase prompts)
+            if [ -f "$key_file.pub" ]; then
+                if ssh-keygen -lf "$key_file.pub" >/dev/null 2>&1; then
+                    found_keys="$found_keys $key_file"
+                    key_count=$((key_count + 1))
+                fi
+            else
+                if ssh-keygen -lf "$key_file" >/dev/null 2>&1; then
+                    found_keys="$found_keys $key_file"
+                    key_count=$((key_count + 1))
+                fi
+            fi
+        fi
+    done
+    
+    if [ $key_count -eq 0 ]; then
+        print_info "No existing SSH keys found in $SSH_DIR"
+        echo ""
+        print_success "SSH Key Switcher initialized successfully!"
+        print_info "Use 'skw add <profile-name>' to create a new profile"
+        print_info "Use 'skw help' to see all available commands"
+        return 0
+    fi
+    
+    # Display found keys
+    print_warning "Found $key_count SSH key(s) in ~/.ssh/:"
+    echo ""
+    
+    key_num=0
+    for key_file in $found_keys; do
+        key_num=$((key_num + 1))
+        key_name=$(basename "$key_file")
+        if [ -f "$key_file.pub" ]; then
+            key_info=$(ssh-keygen -lf "$key_file.pub" 2>/dev/null)
+        else
+            key_info=$(ssh-keygen -lf "$key_file" 2>/dev/null)
+        fi
+        key_type=$(echo "$key_info" | awk '{print $4}' | tr -d '()')
+        key_bits=$(echo "$key_info" | awk '{print $1}')
+        key_fingerprint=$(echo "$key_info" | awk '{print $2}')
+        
+        printf "  %d. %s\n" "$key_num" "$key_name"
+        printf "     Type: %s %s-bit\n" "$key_type" "$key_bits"
+        printf "     Fingerprint: %s\n" "$key_fingerprint"
+        echo ""
+    done
+    
+    # Present options
+    echo "How would you like to organize them?"
+    echo ""
+    echo "  1) Create one profile containing all keys"
+    echo "  2) Create separate profiles for each key"
+    echo "  3) Skip (organize later with 'skw organize')"
+    echo ""
+    printf "Choice [2]: "
+    read -r choice
+    
+    choice=${choice:-2}
+    
+    case $choice in
+        1)
+            # Single profile with all keys
+            echo ""
+            printf "Enter profile name for all keys: "
+            read -r profile_name
+            
+            if [ -z "$profile_name" ]; then
+                print_error "Profile name cannot be empty"
+                exit 1
+            fi
+            
+            profile_dir="$PROFILES_DIR/$profile_name"
+            mkdir -p "$profile_dir"
+            
+            echo ""
+            print_info "Creating profile '$profile_name'..."
+            
+            for key_file in $found_keys; do
+                key_name=$(basename "$key_file")
+                cp "$key_file" "$profile_dir/"
+                if [ -f "$key_file.pub" ]; then
+                    cp "$key_file.pub" "$profile_dir/"
+                fi
+                chmod 600 "$profile_dir/$key_name"
+                if [ -f "$profile_dir/$key_name.pub" ]; then
+                    chmod 644 "$profile_dir/$key_name.pub"
+                fi
+                print_success "Copied $key_name"
+            done
+            
+            # Copy config if exists
+            if [ -f "$SSH_DIR/config" ]; then
+                cp "$SSH_DIR/config" "$profile_dir/"
+                print_success "Copied SSH config"
+            fi
+            
+            echo "$profile_name" > "$CURRENT_PROFILE_FILE"
+            echo ""
+            print_success "Created profile '$profile_name' with $key_count key(s)"
+            print_success "Set '$profile_name' as active profile"
+            ;;
+            
+        2)
+            # Separate profiles for each key
+            echo ""
+            print_info "Creating separate profiles..."
+            echo ""
+            
+            first_profile=""
+            for key_file in $found_keys; do
+                key_name=$(basename "$key_file")
+                
+                # Suggest profile name based on key filename
+                suggested_name=$(echo "$key_name" | sed 's/^id_//' | sed 's/_/-/g')
+                
+                printf "Profile name for '%s' [%s]: " "$key_name" "$suggested_name"
+                read -r profile_name
+                
+                profile_name=${profile_name:-$suggested_name}
+                
+                if [ -z "$profile_name" ]; then
+                    print_warning "Skipping $key_name (no profile name provided)"
+                    continue
+                fi
+                
+                profile_dir="$PROFILES_DIR/$profile_name"
+                mkdir -p "$profile_dir"
+                
+                # Determine standard key name
+                if [ -f "$key_file.pub" ]; then
+                    key_info=$(ssh-keygen -lf "$key_file.pub" 2>/dev/null)
+                else
+                    key_info=$(ssh-keygen -lf "$key_file" 2>/dev/null)
+                fi
+                key_type_info=$(echo "$key_info" | awk '{print $4}' | tr -d '()')
+                
+                if echo "$key_type_info" | grep -qi "rsa"; then
+                    standard_name="id_rsa"
+                elif echo "$key_type_info" | grep -qi "ed25519"; then
+                    standard_name="id_ed25519"
+                elif echo "$key_type_info" | grep -qi "ecdsa"; then
+                    standard_name="id_ecdsa"
+                else
+                    standard_name="id_dsa"
+                fi
+                
+                cp "$key_file" "$profile_dir/$standard_name"
+                chmod 600 "$profile_dir/$standard_name"
+                
+                if [ -f "$key_file.pub" ]; then
+                    cp "$key_file.pub" "$profile_dir/$standard_name.pub"
+                    chmod 644 "$profile_dir/$standard_name.pub"
+                fi
+                
+                print_success "Created profile '$profile_name'"
+                
+                if [ -z "$first_profile" ]; then
+                    first_profile="$profile_name"
+                fi
+            done
+            
+            # Set first profile as active
+            if [ -n "$first_profile" ]; then
+                echo ""
+                printf "Which profile should be active? [%s]: " "$first_profile"
+                read -r active_profile
+                
+                active_profile=${active_profile:-$first_profile}
+                echo "$active_profile" > "$CURRENT_PROFILE_FILE"
+                print_success "Set '$active_profile' as active profile"
+            fi
+            ;;
+            
+        3)
+            # Skip
+            print_info "Skipped key organization"
+            echo ""
+            print_info "You can organize keys later with: skw organize"
+            ;;
+            
+        *)
+            print_error "Invalid choice"
+            exit 1
+            ;;
+    esac
+    
+    echo ""
+    print_success "SSH Key Switcher initialized successfully!"
+    print_info "Use 'skw list' to see all profiles"
+    print_info "Use 'skw help' to see all available commands"
+}
+
+# Add a new profile
+cmd_add() {
+    check_init
+    
+    if [ -z "$1" ]; then
+        print_error "Profile name is required"
+        echo "Usage: skw add <profile-name>"
+        exit 1
+    fi
+    
+    profile_name="$1"
+    profile_dir="$PROFILES_DIR/$profile_name"
+    # Validate profile name: only allow letters, numbers, hyphens, and underscores
+    if echo "$profile_name" | grep -q "[^a-zA-Z0-9_-]"; then
+        print_error "Invalid profile name. Use only letters, numbers, hyphens, and underscores."
+        exit 1
+    fi
+    
+    if [ -d "$profile_dir" ]; then
+        print_error "Profile '$profile_name' already exists"
+        exit 1
+    fi
+    
+    print_info "Creating new SSH key profile: $profile_name"
+    echo ""
+    
+    # Select key type
+    echo "Select key type:"
+    echo "  1) ED25519 (recommended, modern)"
+    echo "  2) RSA 4096 (traditional, widely compatible)"
+    echo "  3) ECDSA 521"
+    printf "Choice [1]: "
+    read -r key_choice
+    
+    key_choice=${key_choice:-1}
+    
+    case $key_choice in
+        1)
+            key_type="ed25519"
+            key_args="-t ed25519"
+            ;;
+        2)
+            key_type="rsa"
+            key_args="-t rsa -b 4096"
+            ;;
+        3)
+            key_type="ecdsa"
+            key_args="-t ecdsa -b 521"
+            ;;
+        *)
+            print_error "Invalid choice"
+            exit 1
+            ;;
+    esac
+    
+    # Get email/comment
+    printf "Enter email/comment (optional): "
+    read -r email_comment
+    
+    # Create profile directory
+    mkdir -p "$profile_dir"
+    
+    # Generate key
+    key_file="$profile_dir/id_$key_type"
+    
+    if [ -n "$email_comment" ]; then
+        ssh-keygen $key_args -f "$key_file" -C "$email_comment"
+    else
+        ssh-keygen $key_args -f "$key_file"
+    fi
+    
+    if [ $? -eq 0 ]; then
+        echo ""
+        print_success "SSH key profile '$profile_name' created successfully!"
+        print_info "Location: $profile_dir"
+        print_info "Use 'skw use $profile_name' to activate this profile"
+    else
+        print_error "Failed to create SSH key"
+        rm -rf "$profile_dir"
+        exit 1
+    fi
+}
+
+# Switch to a profile
+cmd_use() {
+    check_init
+    
+    if [ -z "$1" ]; then
+        print_error "Profile name is required"
+        echo "Usage: skw use <profile-name>"
+        exit 1
+    fi
+    
+    profile_name="$1"
+    profile_dir="$PROFILES_DIR/$profile_name"
+    
+    if [ ! -d "$profile_dir" ]; then
+        print_error "Profile '$profile_name' does not exist"
+        echo "Use 'skw list' to see available profiles"
+        exit 1
+    fi
+    
+    print_info "Switching to profile: $profile_name"
+    
+    # Backup current keys if they exist
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    backup_subdir="$BACKUP_DIR/backup_$timestamp"
+    
+    needs_backup=0
+    for key_type in rsa ed25519 ecdsa; do
+        if [ -f "$SSH_DIR/id_$key_type" ]; then
+            needs_backup=1
+            break
+        fi
+    done
+    
+    if [ $needs_backup -eq 1 ]; then
+        mkdir -p "$backup_subdir"
+        for key_type in rsa ed25519 ecdsa; do
+            if [ -f "$SSH_DIR/id_$key_type" ]; then
+                cp "$SSH_DIR/id_$key_type" "$backup_subdir/" 2>/dev/null || true
+                cp "$SSH_DIR/id_$key_type.pub" "$backup_subdir/" 2>/dev/null || true
+            fi
+        done
+        if [ -f "$SSH_DIR/config" ]; then
+            cp "$SSH_DIR/config" "$backup_subdir/" 2>/dev/null || true
+        fi
+        print_success "Backed up current keys to: $backup_subdir"
+    fi
+    
+    # Remove old keys from SSH directory
+    for key_type in rsa ed25519 ecdsa; do
+        rm -f "$SSH_DIR/id_$key_type" 2>/dev/null || true
+        rm -f "$SSH_DIR/id_$key_type.pub" 2>/dev/null || true
+    done
+    
+    # Copy profile keys to SSH directory
+    for key_file in "$profile_dir"/id_*; do
+        if [ -f "$key_file" ]; then
+            filename=$(basename "$key_file")
+            cp "$key_file" "$SSH_DIR/"
+            
+            # Set correct permissions
+            if echo "$filename" | grep -q '\.pub$'; then
+                chmod 644 "$SSH_DIR/$filename"
+            else
+                chmod 600 "$SSH_DIR/$filename"
+            fi
+        fi
+    done
+    
+    # Copy config if exists
+    if [ -f "$profile_dir/config" ]; then
+        cp "$profile_dir/config" "$SSH_DIR/config"
+        chmod 644 "$SSH_DIR/config"
+    fi
+    
+    # Update SSH agent
+    if command -v ssh-add >/dev/null 2>&1; then
+        ssh-add -D 2>/dev/null || true
+        for key_type in rsa ed25519 ecdsa; do
+            if [ -f "$SSH_DIR/id_$key_type" ]; then
+                ssh-add "$SSH_DIR/id_$key_type" 2>/dev/null || true
+            fi
+        done
+    fi
+    
+    # Save current profile
+    echo "$profile_name" > "$CURRENT_PROFILE_FILE"
+    
+    echo ""
+    print_success "Switched to profile: $profile_name"
+    
+    # Show key fingerprint
+    for key_type in rsa ed25519 ecdsa; do
+        if [ -f "$SSH_DIR/id_$key_type.pub" ]; then
+            fingerprint=$(ssh-keygen -lf "$SSH_DIR/id_$key_type.pub" 2>/dev/null)
+            print_info "Key fingerprint: $fingerprint"
+        fi
+    done
+}
+
+# List all profiles
+cmd_list() {
+    check_init
+    
+    if [ ! "$(ls -A "$PROFILES_DIR" 2>/dev/null | grep -v '^\.')" ]; then
+        print_warning "No profiles found"
+        print_info "Use 'skw add <profile-name>' to create a profile"
+        exit 0
+    fi
+    
+    current_profile=""
+    if [ -f "$CURRENT_PROFILE_FILE" ]; then
+        current_profile=$(cat "$CURRENT_PROFILE_FILE")
+    fi
+    
+    echo "Available SSH key profiles:"
+    echo ""
+    
+    for profile_dir in "$PROFILES_DIR"/*; do
+        if [ -d "$profile_dir" ]; then
+            profile_name=$(basename "$profile_dir")
+            
+            # Skip hidden files/directories
+            if echo "$profile_name" | grep -q "^\."; then
+                continue
+            fi
+            
+            # Mark current profile
+            if [ "$profile_name" = "$current_profile" ]; then
+                printf "${GREEN}* %s (active)${NC}\n" "$profile_name"
+            else
+                printf "  %s\n" "$profile_name"
+            fi
+            
+            # Show key info
+            for key_type in rsa ed25519 ecdsa; do
+                key_file="$profile_dir/id_$key_type.pub"
+                if [ -f "$key_file" ]; then
+                    fingerprint=$(ssh-keygen -lf "$key_file" 2>/dev/null | awk '{print $1" "$2" "$4}')
+                    printf "    %s\n" "$fingerprint"
+                fi
+            done
+            echo ""
+        fi
+    done
+}
+
+# Show current profile
+cmd_current() {
+    check_init
+    
+    if [ ! -f "$CURRENT_PROFILE_FILE" ]; then
+        print_warning "No active profile"
+        exit 0
+    fi
+    
+    current_profile=$(cat "$CURRENT_PROFILE_FILE")
+    profile_dir="$PROFILES_DIR/$current_profile"
+    
+    if [ ! -d "$profile_dir" ]; then
+        print_error "Current profile '$current_profile' no longer exists"
+        rm -f "$CURRENT_PROFILE_FILE"
+        exit 1
+    fi
+    
+    print_info "Current profile: $current_profile"
+    echo ""
+    
+    for key_type in rsa ed25519 ecdsa; do
+        key_file="$SSH_DIR/id_$key_type.pub"
+        if [ -f "$key_file" ]; then
+            fingerprint=$(ssh-keygen -lf "$key_file" 2>/dev/null)
+            echo "Key fingerprint: $fingerprint"
+        fi
+    done
+}
+
+# Remove a profile
+cmd_remove() {
+    check_init
+    
+    if [ -z "$1" ]; then
+        print_error "Profile name is required"
+        echo "Usage: skw remove <profile-name>"
+        exit 1
+    fi
+    
+    profile_name="$1"
+    profile_dir="$PROFILES_DIR/$profile_name"
+    
+    if [ ! -d "$profile_dir" ]; then
+        print_error "Profile '$profile_name' does not exist"
+        exit 1
+    fi
+    
+    # Check if it's the current profile
+    if [ -f "$CURRENT_PROFILE_FILE" ]; then
+        current_profile=$(cat "$CURRENT_PROFILE_FILE")
+        if [ "$current_profile" = "$profile_name" ]; then
+            print_error "Cannot remove active profile '$profile_name'"
+            print_info "Switch to another profile first with 'skw use <profile-name>'"
+            exit 1
+        fi
+    fi
+    
+    # Confirm deletion
+    print_warning "This will permanently delete profile '$profile_name'"
+    printf "Are you sure? (y/N): "
+    read -r response
+    
+    if [ "$response" = "y" ] || [ "$response" = "Y" ]; then
+        rm -rf "$profile_dir"
+        print_success "Profile '$profile_name' removed"
+    else
+        print_info "Cancelled"
+    fi
+}
+
+# Rename a profile
+cmd_rename() {
+    check_init
+
+    if [ -z "$1" ] || [ -z "$2" ]; then
+        print_error "Old and new profile names are required"
+        echo "Usage: skw rename <old-profile-name> <new-profile-name>"
+        exit 1
+    fi
+
+    old_name="$1"
+    new_name="$2"
+
+    # Validate names
+    if echo "$old_name" | grep -q "[^a-zA-Z0-9_-]"; then
+        print_error "Invalid old profile name. Use only letters, numbers, hyphens, and underscores."
+        exit 1
+    fi
+    if echo "$new_name" | grep -q "[^a-zA-Z0-9_-]"; then
+        print_error "Invalid new profile name. Use only letters, numbers, hyphens, and underscores."
+        exit 1
+    fi
+
+    old_dir="$PROFILES_DIR/$old_name"
+    new_dir="$PROFILES_DIR/$new_name"
+
+    if [ ! -d "$old_dir" ]; then
+        print_error "Profile '$old_name' does not exist"
+        exit 1
+    fi
+
+    if [ -d "$new_dir" ]; then
+        print_error "Profile '$new_name' already exists"
+        exit 1
+    fi
+
+    # Perform rename
+    mv -- "$old_dir" "$new_dir" 2>/dev/null || mv "$old_dir" "$new_dir"
+
+    # If the renamed profile was active, update current profile pointer
+    if [ -f "$CURRENT_PROFILE_FILE" ]; then
+        current_profile=$(cat "$CURRENT_PROFILE_FILE")
+        if [ "$current_profile" = "$old_name" ]; then
+            echo "$new_name" > "$CURRENT_PROFILE_FILE"
+        fi
+    fi
+
+    print_success "Renamed profile '$old_name' -> '$new_name'"
+    print_info "Use 'skw list' to verify"
+}
+
+# Organize unmanaged keys
+cmd_organize() {
+    check_init
+    
+    print_info "Scanning ~/.ssh/ for unmanaged keys..."
+    echo ""
+    
+    # Create backup first
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    backup_subdir="$BACKUP_DIR/organize_backup_$timestamp"
+    
+    # Find all potential key files in ~/.ssh/
+    unmanaged_keys=""
+    key_count=0
+    
+    for key_file in "$SSH_DIR"/id_*; do
+        if [ -f "$key_file" ] && ! echo "$key_file" | grep -q '\.pub$'; then
+            # Exclude non-key files
+            basename_key=$(basename "$key_file")
+            if echo "$basename_key" | grep -q "^known_hosts\|^config\|^authorized_keys\|^environment"; then
+                continue
+            fi
+            
+            # Verify it's a valid SSH key (prefer public key to avoid passphrase prompts)
+            if [ -f "$key_file.pub" ]; then
+                if ! ssh-keygen -lf "$key_file.pub" >/dev/null 2>&1; then
+                    continue
+                fi
+            else
+                if ! ssh-keygen -lf "$key_file" >/dev/null 2>&1; then
+                    continue
+                fi
+            fi
+            
+            # Check if this key is already managed
+            if [ -f "$key_file.pub" ]; then
+                key_fingerprint=$(ssh-keygen -lf "$key_file.pub" 2>/dev/null | awk '{print $2}')
+            else
+                key_fingerprint=$(ssh-keygen -lf "$key_file" 2>/dev/null | awk '{print $2}')
+            fi
+            
+            if [ -z "$key_fingerprint" ]; then
+                continue
+            fi
+            
+            is_managed=0
+            
+            # Check all profiles
+            for profile_dir in "$PROFILES_DIR"/*; do
+                if [ -d "$profile_dir" ]; then
+                    for profile_key in "$profile_dir"/id_*; do
+                        if [ -f "$profile_key" ] && ! echo "$profile_key" | grep -q '\.pub$'; then
+                            if [ -f "$profile_key.pub" ]; then
+                                profile_fingerprint=$(ssh-keygen -lf "$profile_key.pub" 2>/dev/null | awk '{print $2}')
+                            else
+                                profile_fingerprint=$(ssh-keygen -lf "$profile_key" 2>/dev/null | awk '{print $2}')
+                            fi
+                            if [ "$key_fingerprint" = "$profile_fingerprint" ]; then
+                                is_managed=1
+                                break
+                            fi
+                        fi
+                    done
+                fi
+                
+                if [ $is_managed -eq 1 ]; then
+                    break
+                fi
+            done
+            
+            if [ $is_managed -eq 0 ]; then
+                unmanaged_keys="$unmanaged_keys $key_file"
+                key_count=$((key_count + 1))
+            fi
+        fi
+    done
+    
+    if [ $key_count -eq 0 ]; then
+        print_success "No unmanaged keys found!"
+        print_info "All SSH keys are already organized in profiles."
+        exit 0
+    fi
+    
+    print_warning "Found $key_count unmanaged key(s)"
+    echo ""
+    
+    # Backup unmanaged keys
+    mkdir -p "$backup_subdir"
+    for key_file in $unmanaged_keys; do
+        cp "$key_file" "$backup_subdir/" 2>/dev/null || true
+        if [ -f "$key_file.pub" ]; then
+            cp "$key_file.pub" "$backup_subdir/" 2>/dev/null || true
+        fi
+    done
+    print_info "Backed up unmanaged keys to: $backup_subdir"
+    echo ""
+    
+    # Process each unmanaged key
+    current_key=0
+    organized_count=0
+    skipped_count=0
+    
+    for key_file in $unmanaged_keys; do
+        current_key=$((current_key + 1))
+        
+        key_name=$(basename "$key_file")
+        if [ -f "$key_file.pub" ]; then
+            key_info=$(ssh-keygen -lf "$key_file.pub" 2>/dev/null)
+        else
+            key_info=$(ssh-keygen -lf "$key_file" 2>/dev/null)
+        fi
+        key_type_info=$(echo "$key_info" | awk '{print $4}' | tr -d '()')
+        key_bits=$(echo "$key_info" | awk '{print $1}')
+        key_fingerprint=$(echo "$key_info" | awk '{print $2}')
+        if [ -f "$key_file.pub" ]; then
+            key_comment=$(ssh-keygen -lf "$key_file.pub" 2>/dev/null | cut -d' ' -f3-)
+        else
+            key_comment=$(ssh-keygen -lf "$key_file" 2>/dev/null | cut -d' ' -f3-)
+        fi
+        
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+        printf "${BLUE}Key %d/%d: %s${NC}\n" "$current_key" "$key_count" "$key_name"
+        echo "  Type: $key_type_info $key_bits"
+        echo "  Fingerprint: $key_fingerprint"
+        if [ -n "$key_comment" ]; then
+            echo "  Comment: $key_comment"
+        fi
+        echo ""
+        
+        printf "Enter profile name for this key (or 'skip'): "
+        read -r profile_name
+        
+        if [ "$profile_name" = "skip" ] || [ -z "$profile_name" ]; then
+            print_info "Skipped"
+            skipped_count=$((skipped_count + 1))
+            echo ""
+            continue
+        fi
+        
+        # Validate profile name
+        if echo "$profile_name" | grep -q "[^a-zA-Z0-9_-]"; then
+            print_error "Invalid profile name. Use only letters, numbers, hyphens, and underscores."
+            skipped_count=$((skipped_count + 1))
+            echo ""
+            continue
+        fi
+        
+        profile_dir="$PROFILES_DIR/$profile_name"
+        
+        # Create profile directory if it doesn't exist
+        if [ ! -d "$profile_dir" ]; then
+            mkdir -p "$profile_dir"
+            print_info "Created new profile: $profile_name"
+        fi
+        
+        # Determine the key type for standard naming
+        if echo "$key_type_info" | grep -qi "rsa"; then
+            standard_name="id_rsa"
+        elif echo "$key_type_info" | grep -qi "ed25519"; then
+            standard_name="id_ed25519"
+        elif echo "$key_type_info" | grep -qi "ecdsa"; then
+            standard_name="id_ecdsa"
+        elif echo "$key_type_info" | grep -qi "dsa"; then
+            standard_name="id_dsa"
+        else
+            standard_name="id_$key_type_info"
+        fi
+        
+        # Check if profile already has a key of this type
+        if [ -f "$profile_dir/$standard_name" ]; then
+            print_warning "Profile '$profile_name' already has a $key_type_info key"
+            printf "Overwrite? (y/N): "
+            read -r overwrite
+            
+            if [ "$overwrite" != "y" ] && [ "$overwrite" != "Y" ]; then
+                print_info "Skipped"
+                skipped_count=$((skipped_count + 1))
+                echo ""
+                continue
+            fi
+        fi
+        
+        # Copy key files to profile
+        cp "$key_file" "$profile_dir/$standard_name"
+        chmod 600 "$profile_dir/$standard_name"
+        
+        if [ -f "$key_file.pub" ]; then
+            cp "$key_file.pub" "$profile_dir/$standard_name.pub"
+            chmod 644 "$profile_dir/$standard_name.pub"
+        fi
+        
+        print_success "Moved $key_name to profile '$profile_name' as $standard_name"
+        organized_count=$((organized_count + 1))
+        echo ""
+    done
+    
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    print_info "Summary:"
+    echo "  ✓ $organized_count key(s) organized into profiles"
+    echo "  • $skipped_count key(s) skipped"
+    echo ""
+    
+    if [ $organized_count -gt 0 ]; then
+        print_success "Keys have been organized!"
+        print_info "Original keys are backed up in: $backup_subdir"
+        print_info "Use 'skw list' to see all profiles"
+    fi
+}
+
+# Manual backup
+cmd_backup() {
+    if [ ! -d "$SSH_DIR" ]; then
+        print_error "SSH directory not found: $SSH_DIR"
+        exit 1
+    fi
+    
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    backup_subdir="$BACKUP_DIR/manual_backup_$timestamp"
+    
+    has_keys=0
+    for key_type in rsa ed25519 ecdsa; do
+        if [ -f "$SSH_DIR/id_$key_type" ]; then
+            has_keys=1
+            break
+        fi
+    done
+    
+    if [ $has_keys -eq 0 ]; then
+        print_warning "No SSH keys found in $SSH_DIR"
+        exit 0
+    fi
+    
+    mkdir -p "$backup_subdir"
+    
+    for key_type in rsa ed25519 ecdsa; do
+        if [ -f "$SSH_DIR/id_$key_type" ]; then
+            cp "$SSH_DIR/id_$key_type" "$backup_subdir/" 2>/dev/null || true
+            cp "$SSH_DIR/id_$key_type.pub" "$backup_subdir/" 2>/dev/null || true
+        fi
+    done
+    
+    if [ -f "$SSH_DIR/config" ]; then
+        cp "$SSH_DIR/config" "$backup_subdir/" 2>/dev/null || true
+    fi
+    
+    print_success "Backup created: $backup_subdir"
+}
+
+# Show help
+cmd_help() {
+    cat << EOF
+SSH Key Switcher (skw) v${VERSION}
+A tool to manage multiple SSH key profiles
+
+USAGE:
+    skw <command> [options]
+
+COMMANDS:
+    init                     Initialize SSH Key Switcher
+    add <profile-name>       Create a new SSH key profile
+    use <profile-name>       Switch to a different profile
+    list                     List all available profiles
+    current                  Show the current active profile
+    remove <profile-name>    Remove a profile
+    organize                 Interactively organize unmanaged SSH keys
+    backup                   Create a manual backup of current keys
+    help                     Show this help message
+    version                  Show version information
+
+     rename                  Rename an existing profile (rename <old> <new>)
+
+EXAMPLES:
+    skw init                 # Set up SSH Key Switcher
+    skw add work             # Create 'work' profile with new SSH key
+    skw add personal         # Create 'personal' profile with new SSH key
+    skw add github-corp      # Create 'github-corp' profile
+    skw use work             # Switch to 'work' profile
+    skw use personal         # Switch to 'personal' profile
+    skw list                 # Show all profiles (active marked with *)
+    skw current              # Display currently active profile
+    skw organize             # Import existing SSH keys into profiles
+    skw remove github-corp   # Delete 'github-corp' profile
+    skw backup               # Backup current SSH keys
+     skw rename old new       # Rename profile 'old' to 'new'
+
+DIRECTORIES:
+    Profiles: ~/.ssh-profiles/
+    Backups:  ~/.ssh-backup/
+
+For more information, visit: https://github.com/AnthonyQuy/ssh-key-switcher
+EOF
+}
+
+# Show version
+cmd_version() {
+    echo "SSH Key Switcher (skw) v${VERSION}"
+}
+
+# Main command dispatcher
+main() {
+    if [ $# -eq 0 ]; then
+        cmd_help
+        exit 0
+    fi
+    
+    command="$1"
+    shift
+    
+    case "$command" in
+        init)
+            cmd_init "$@"
+            ;;
+        add)
+            cmd_add "$@"
+            ;;
+        use)
+            cmd_use "$@"
+            ;;
+        rename|mv)
+            cmd_rename "$@"
+            ;;
+        list|ls)
+            cmd_list "$@"
+            ;;
+        current)
+            cmd_current "$@"
+            ;;
+        remove|rm)
+            cmd_remove "$@"
+            ;;
+        organize)
+            cmd_organize "$@"
+            ;;
+        backup)
+            cmd_backup "$@"
+            ;;
+        help|--help|-h)
+            cmd_help
+            ;;
+        version|--version|-v)
+            cmd_version
+            ;;
+        *)
+            print_error "Unknown command: $command"
+            echo "Run 'skw help' for usage information"
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
