@@ -130,32 +130,43 @@ if [ "${NEEDS_PATH_UPDATE:-0}" -eq 1 ]; then
     SHELL_CONFIG=""
     SHELL_NAME=""
     
-    if [ -n "$BASH_VERSION" ]; then
-        SHELL_NAME="bash"
-        if [ -f "$HOME/.bashrc" ]; then
-            SHELL_CONFIG="$HOME/.bashrc"
-        elif [ -f "$HOME/.bash_profile" ]; then
-            SHELL_CONFIG="$HOME/.bash_profile"
-        fi
-    elif [ -n "$ZSH_VERSION" ]; then
-        SHELL_NAME="zsh"
-        SHELL_CONFIG="$HOME/.zshrc"
-    else
-        # Try to detect from SHELL variable
-        case "$SHELL" in
-            */zsh)
-                SHELL_NAME="zsh"
+    # Primary detection: check SHELL environment variable first (most reliable)
+    case "$SHELL" in
+        */zsh)
+            SHELL_NAME="zsh"
+            if [ -f "$HOME/.zshrc" ]; then
                 SHELL_CONFIG="$HOME/.zshrc"
-                ;;
-            */bash)
-                SHELL_NAME="bash"
-                if [ -f "$HOME/.bashrc" ]; then
-                    SHELL_CONFIG="$HOME/.bashrc"
-                elif [ -f "$HOME/.bash_profile" ]; then
-                    SHELL_CONFIG="$HOME/.bash_profile"
-                fi
-                ;;
-        esac
+            fi
+            ;;
+        */bash)
+            SHELL_NAME="bash"
+            if [ -f "$HOME/.bashrc" ]; then
+                SHELL_CONFIG="$HOME/.bashrc"
+            elif [ -f "$HOME/.bash_profile" ]; then
+                SHELL_CONFIG="$HOME/.bash_profile"
+            fi
+            ;;
+        */fish)
+            SHELL_NAME="fish"
+            if [ -d "$HOME/.config/fish" ]; then
+                SHELL_CONFIG="$HOME/.config/fish/config.fish"
+            fi
+            ;;
+    esac
+    
+    # Fallback: check version variables (when running in native shell)
+    if [ -z "$SHELL_CONFIG" ]; then
+        if [ -n "$ZSH_VERSION" ]; then
+            SHELL_NAME="zsh"
+            SHELL_CONFIG="$HOME/.zshrc"
+        elif [ -n "$BASH_VERSION" ]; then
+            SHELL_NAME="bash"
+            if [ -f "$HOME/.bashrc" ]; then
+                SHELL_CONFIG="$HOME/.bashrc"
+            elif [ -f "$HOME/.bash_profile" ]; then
+                SHELL_CONFIG="$HOME/.bash_profile"
+            fi
+        fi
     fi
     
     print_warning "$INSTALL_DIR is not in your PATH"
@@ -163,7 +174,7 @@ if [ "${NEEDS_PATH_UPDATE:-0}" -eq 1 ]; then
     
     if [ -n "$SHELL_CONFIG" ]; then
         printf "Would you like to add it to $SHELL_CONFIG automatically? (Y/n): "
-        read -r response
+        read -r response </dev/tty
         
         response=${response:-Y}
         
@@ -212,7 +223,7 @@ if command -v skw >/dev/null 2>&1; then
     
     # Ask if user wants to initialize
     printf "Would you like to initialize SSH Key Switcher now? (Y/n): "
-    read -r response
+    read -r response </dev/tty
     
     response=${response:-Y}
     
