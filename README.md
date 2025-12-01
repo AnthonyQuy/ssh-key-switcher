@@ -19,18 +19,24 @@ A simple command-line tool to manage multiple SSH key profiles. Easily switch be
 The fastest way to install - downloads and runs the installer automatically:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/AnthonyQuy/ssh-key-switcher/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/AnthonyQuy/ssh-key-switcher/main/bootstrap.sh | bash
 ```
 
 This will:
-- ✅ Download and install skw
+- ✅ Download and install skw automatically
 - ✅ Auto-detect your shell (bash/zsh)
 - ✅ Configure PATH automatically
 - ✅ Check dependencies
+- ✅ Works in any directory
 
-**Security Note:** You can inspect the install script first:
+**Alternative (if you prefer wget):**
 ```bash
-curl -sSL https://raw.githubusercontent.com/AnthonyQuy/ssh-key-switcher/main/install.sh | less
+wget -qO- https://raw.githubusercontent.com/AnthonyQuy/ssh-key-switcher/main/bootstrap.sh | bash
+```
+
+**Security Note:** You can inspect the bootstrap script first:
+```bash
+curl -sSL https://raw.githubusercontent.com/AnthonyQuy/ssh-key-switcher/main/bootstrap.sh | less
 ```
 
 ### 📦 Standard Install (Clone Repository)
